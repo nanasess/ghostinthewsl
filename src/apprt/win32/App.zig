@@ -534,6 +534,17 @@ pub fn closeWindow(self: *App, window: *Window) void {
     }
 }
 
+/// Worker that opens a URL via ShellExecuteW off the UI thread.
+/// Takes ownership of `url_utf16` and frees it. COM is initialized as STA
+/// because ShellExecuteW may invoke COM-based shell handlers.
+fn openUrlThread(alloc: Allocator, url_utf16: [:0]u16) void {
+    defer alloc.free(url_utf16);
+    const hr = sys.CoInitializeEx(null, sys.COINIT_APARTMENTTHREADED | sys.COINIT_DISABLE_OLE1DDE);
+    defer if (hr == sys.S_OK or hr == sys.S_FALSE) sys.CoUninitialize();
+    const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
+    _ = sys.ShellExecuteW(null, verb, url_utf16.ptr, null, null, sys.SW_SHOWNORMAL);
+}
+
 pub fn performAction(
     self: *App,
     target: apprt.Target,
@@ -632,10 +643,22 @@ pub fn performAction(
             return true;
         },
         .open_url => {
+            // ShellExecuteW must NOT run on the UI thread: it is synchronous and
+            // can delegate to COM-based shell extensions, which need a message
+            // pump. Calling it here blocks the message loop and deadlocks the
+            // whole app (and intermittently faults) — observed as a freeze on
+            // ctrl+click of a URL. Run it on a detached STA thread instead.
             const url_utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, value.url) catch return false;
-            defer self.alloc.free(url_utf16);
-            const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
-            _ = sys.ShellExecuteW(null, verb, url_utf16.ptr, null, null, sys.SW_SHOWNORMAL);
+            const thread = std.Thread.spawn(.{}, openUrlThread, .{ self.alloc, url_utf16 }) catch |err| {
+                // Thread spawn failed: free and fall back to the (blocking) call
+                // so the URL still opens. This path is not expected in practice.
+                log.warn("open_url: thread spawn failed, opening synchronously: {}", .{err});
+                defer self.alloc.free(url_utf16);
+                const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
+                _ = sys.ShellExecuteW(null, verb, url_utf16.ptr, null, null, sys.SW_SHOWNORMAL);
+                return true;
+            };
+            thread.detach();
             return true;
         },
         .ring_bell => {
