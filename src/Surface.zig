@@ -2074,19 +2074,27 @@ fn resolvePathForOpening(
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
     if (!std.fs.path.isAbsolute(path)) {
+        // On Windows a relative local path never contains ':'. A clicked
+        // string that does (e.g. a URL such as https://… or mailto:…) is not a
+        // local file. Resolving it against the terminal pwd and calling
+        // std.fs.accessAbsolute can panic on the resulting invalid NT path:
+        // here the terminal pwd is a POSIX path (the shell runs in WSL) while
+        // std.fs uses Windows semantics, so resolve produces something like
+        // `C:\…\https:\…` that passes isAbsolute but is rejected during NT path
+        // conversion. Bail out so the caller opens the original string as-is.
+        // (POSIX builds resolve such strings fine and report a normal error,
+        // so this guard is Windows-only to avoid changing their behavior.)
+        if (builtin.os.tag == .windows and
+            std.mem.indexOfScalar(u8, path, ':') != null) return null;
+
         const terminal_pwd = self.io.terminal.getPwd() orelse {
             return null;
         };
 
         const resolved = try std.fs.path.resolve(self.alloc, &.{ terminal_pwd, path });
 
-        // std.fs.path.resolve does not guarantee an absolute result. When the
-        // UI is a Windows process but the shell runs in WSL, terminal_pwd is a
-        // POSIX path (e.g. /home/user) resolved under Windows path semantics,
-        // so the result may not be Windows-absolute. Passing such a path to
-        // accessAbsolute trips a std safety check and panics (observed as a
-        // crash when ctrl+clicking a URL). Bail out instead; the caller then
-        // opens the original string as-is, which is correct for URLs.
+        // Defensive: std.fs.path.resolve does not guarantee an absolute result,
+        // and accessAbsolute requires one.
         if (!std.fs.path.isAbsolute(resolved)) {
             self.alloc.free(resolved);
             return null;
