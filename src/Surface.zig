@@ -2080,6 +2080,18 @@ fn resolvePathForOpening(
 
         const resolved = try std.fs.path.resolve(self.alloc, &.{ terminal_pwd, path });
 
+        // std.fs.path.resolve does not guarantee an absolute result. When the
+        // UI is a Windows process but the shell runs in WSL, terminal_pwd is a
+        // POSIX path (e.g. /home/user) resolved under Windows path semantics,
+        // so the result may not be Windows-absolute. Passing such a path to
+        // accessAbsolute trips a std safety check and panics (observed as a
+        // crash when ctrl+clicking a URL). Bail out instead; the caller then
+        // opens the original string as-is, which is correct for URLs.
+        if (!std.fs.path.isAbsolute(resolved)) {
+            self.alloc.free(resolved);
+            return null;
+        }
+
         std.fs.accessAbsolute(resolved, .{}) catch {
             self.alloc.free(resolved);
             return null;
