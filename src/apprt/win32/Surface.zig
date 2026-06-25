@@ -383,6 +383,15 @@ pub fn deinit(self: *Self) void {
     if (self.hdc != null) {
         _ = ReleaseDC(self.hwnd, self.hdc);
     }
+    // Destroy the main surface window and clear its USERDATA. Without this,
+    // after closeSurface frees the Surface the main HWND stays alive holding a
+    // dangling pointer; the immediately following closeEmptyTabAt -> activateTab
+    // SetFocus dispatches messages (e.g. focus changes) to surfaceWndProc, which
+    // dereferences the freed Surface and faults with 0xc0000005 (use-after-free).
+    // Clearing USERDATA to 0 also makes already-queued/reentrant messages hit the
+    // `ptr == 0` guard in surfaceWndProc instead.
+    _ = SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
+    _ = DestroyWindow(self.hwnd);
 }
 
 fn initOpenGL(self: *Self) !void {
