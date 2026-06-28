@@ -534,13 +534,11 @@ pub fn closeWindow(self: *App, window: *Window) void {
     }
 }
 
-/// Worker that opens a URL via ShellExecuteW off the UI thread.
-/// Takes ownership of `url_utf16` and frees it. COM is initialized as STA
-/// because ShellExecuteW may invoke COM-based shell handlers.
-fn openUrlThread(alloc: Allocator, url_utf16: [:0]u16) void {
-    defer alloc.free(url_utf16);
+fn openUrlThread(url_utf16: [:0]u16) void {
+    defer std.heap.page_allocator.free(url_utf16);
     const hr = sys.CoInitializeEx(null, sys.COINIT_APARTMENTTHREADED | sys.COINIT_DISABLE_OLE1DDE);
     defer if (hr == sys.S_OK or hr == sys.S_FALSE) sys.CoUninitialize();
+
     const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
     _ = sys.ShellExecuteW(null, verb, url_utf16.ptr, null, null, sys.SW_SHOWNORMAL);
 }
@@ -643,17 +641,10 @@ pub fn performAction(
             return true;
         },
         .open_url => {
-            // ShellExecuteW must NOT run on the UI thread: it is synchronous and
-            // can delegate to COM-based shell extensions, which need a message
-            // pump. Calling it here blocks the message loop and deadlocks the
-            // whole app (and intermittently faults) — observed as a freeze on
-            // ctrl+click of a URL. Run it on a detached STA thread instead.
-            const url_utf16 = std.unicode.utf8ToUtf16LeAllocZ(self.alloc, value.url) catch return false;
-            const thread = std.Thread.spawn(.{}, openUrlThread, .{ self.alloc, url_utf16 }) catch |err| {
-                // Thread spawn failed: free and fall back to the (blocking) call
-                // so the URL still opens. This path is not expected in practice.
+            const url_utf16 = std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, value.url) catch return false;
+            const thread = std.Thread.spawn(.{}, openUrlThread, .{url_utf16}) catch |err| {
                 log.warn("open_url: thread spawn failed, opening synchronously: {}", .{err});
-                defer self.alloc.free(url_utf16);
+                defer std.heap.page_allocator.free(url_utf16);
                 const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
                 _ = sys.ShellExecuteW(null, verb, url_utf16.ptr, null, null, sys.SW_SHOWNORMAL);
                 return true;
@@ -665,6 +656,7 @@ pub fn performAction(
             _ = MessageBeep(0xFFFFFFFF);
             return true;
         },
+        .selection_changed => return true,
         .progress_report => {
             const surface = switch (target) {
                 .app => return false,
@@ -1146,6 +1138,33 @@ pub fn performIpc(
             }
             return true;
         },
+        .toggle_quick_terminal => {
+            switch (target) {
+                .class => |class| {
+                    try stderr.print(
+                        "Win32 IPC does not yet support targeting a custom Ghostty class: {s}\n",
+                        .{class},
+                    );
+                    try stderr.flush();
+                    return error.IPCFailed;
+                },
+                .detect => {},
+            }
+
+            const class_name = std.unicode.utf8ToUtf16LeStringLiteral("GhosttyWindow");
+            const hwnd = sys.FindWindowW(class_name, null) orelse {
+                try stderr.print("No running Ghostty Win32 instance was found.\n", .{});
+                try stderr.flush();
+                return error.IPCFailed;
+            };
+
+            if (sys.PostMessageW(hwnd, sys.WM_APP_TOGGLE_QUICK_TERMINAL, 0, 0) == 0) {
+                try stderr.print("Failed to send a quick-terminal toggle request to Ghostty.\n", .{});
+                try stderr.flush();
+                return error.IPCFailed;
+            }
+            return true;
+        },
     }
 }
 
@@ -1302,16 +1321,42 @@ fn shouldDispatchKeyPress(vk: WPARAM, mods: @import("../../input.zig").Mods) boo
 
 fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
     return switch (vk) {
-        0x41 => .key_a, 0x42 => .key_b, 0x43 => .key_c, 0x44 => .key_d,
-        0x45 => .key_e, 0x46 => .key_f, 0x47 => .key_g, 0x48 => .key_h,
-        0x49 => .key_i, 0x4A => .key_j, 0x4B => .key_k, 0x4C => .key_l,
-        0x4D => .key_m, 0x4E => .key_n, 0x4F => .key_o, 0x50 => .key_p,
-        0x51 => .key_q, 0x52 => .key_r, 0x53 => .key_s, 0x54 => .key_t,
-        0x55 => .key_u, 0x56 => .key_v, 0x57 => .key_w, 0x58 => .key_x,
-        0x59 => .key_y, 0x5A => .key_z,
-        0x30 => .digit_0, 0x31 => .digit_1, 0x32 => .digit_2, 0x33 => .digit_3,
-        0x34 => .digit_4, 0x35 => .digit_5, 0x36 => .digit_6, 0x37 => .digit_7,
-        0x38 => .digit_8, 0x39 => .digit_9,
+        0x41 => .key_a,
+        0x42 => .key_b,
+        0x43 => .key_c,
+        0x44 => .key_d,
+        0x45 => .key_e,
+        0x46 => .key_f,
+        0x47 => .key_g,
+        0x48 => .key_h,
+        0x49 => .key_i,
+        0x4A => .key_j,
+        0x4B => .key_k,
+        0x4C => .key_l,
+        0x4D => .key_m,
+        0x4E => .key_n,
+        0x4F => .key_o,
+        0x50 => .key_p,
+        0x51 => .key_q,
+        0x52 => .key_r,
+        0x53 => .key_s,
+        0x54 => .key_t,
+        0x55 => .key_u,
+        0x56 => .key_v,
+        0x57 => .key_w,
+        0x58 => .key_x,
+        0x59 => .key_y,
+        0x5A => .key_z,
+        0x30 => .digit_0,
+        0x31 => .digit_1,
+        0x32 => .digit_2,
+        0x33 => .digit_3,
+        0x34 => .digit_4,
+        0x35 => .digit_5,
+        0x36 => .digit_6,
+        0x37 => .digit_7,
+        0x38 => .digit_8,
+        0x39 => .digit_9,
         0x08 => .backspace,
         0x09 => .tab,
         0x0D => .enter,
@@ -1340,9 +1385,18 @@ fn mapVirtualKey(vk: WPARAM) @import("../../input.zig").Key {
         0xBC => .comma,
         0xBE => .period,
         0xBF => .slash,
-        0x70 => .f1, 0x71 => .f2, 0x72 => .f3, 0x73 => .f4,
-        0x74 => .f5, 0x75 => .f6, 0x76 => .f7, 0x77 => .f8,
-        0x78 => .f9, 0x79 => .f10, 0x7A => .f11, 0x7B => .f12,
+        0x70 => .f1,
+        0x71 => .f2,
+        0x72 => .f3,
+        0x73 => .f4,
+        0x74 => .f5,
+        0x75 => .f6,
+        0x76 => .f7,
+        0x77 => .f8,
+        0x78 => .f9,
+        0x79 => .f10,
+        0x7A => .f11,
+        0x7B => .f12,
         else => .unidentified,
     };
 }
@@ -1482,6 +1536,14 @@ pub fn wndProc(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) callconv(.
             if (getWindow(hwnd)) |window| {
                 window.app.newWindow(.none) catch |err| {
                     log.err("new_window from IPC failed: {}", .{err});
+                };
+            }
+            return 0;
+        },
+        sys.WM_APP_TOGGLE_QUICK_TERMINAL => {
+            if (getWindow(hwnd)) |window| {
+                _ = window.app.performAction(.app, .toggle_quick_terminal, {}) catch |err| {
+                    log.err("toggle_quick_terminal from IPC failed: {}", .{err});
                 };
             }
             return 0;
