@@ -139,10 +139,6 @@ pub extern "user32" fn GetMonitorInfoW(hMonitor: ?*anyopaque, lpmi: *MONITORINFO
 pub extern "user32" fn SetFocus(hWnd: HWND) callconv(.winapi) ?HWND;
 pub extern "user32" fn GetDpiForWindow(hWnd: HWND) callconv(.winapi) UINT;
 pub extern "shell32" fn ShellExecuteW(hwnd: ?HWND, lpOperation: ?[*:0]const u16, lpFile: [*:0]const u16, lpParameters: ?[*:0]const u16, lpDirectory: ?[*:0]const u16, nShowCmd: c_int) callconv(.winapi) ?*anyopaque;
-
-// COM, required by ShellExecuteW: it can delegate to COM-based shell
-// extensions (verb handlers, data sources), so COM must be initialized on the
-// calling thread. Used to run ShellExecuteW on a dedicated STA thread.
 pub const HRESULT = i32;
 pub const S_OK: HRESULT = 0;
 pub const S_FALSE: HRESULT = 1;
@@ -159,3 +155,4 @@ pub extern "user32" fn FindWindowW(lpClassName: ?[*:0]const u16, lpWindowName: ?
 pub const ERROR_ALREADY_EXISTS: DWORD = 183;
 /// Custom app message used for single-instance "open new window" notification.
 pub const WM_APP_NEW_WINDOW: UINT = 0x8000 + 1; // WM_APP + 1
+pub const WM_APP_TOGGLE_QUICK_TERMINAL: UINT = 0x8000 + 2; // WM_APP + 2
