@@ -12,6 +12,7 @@ const configpkg = @import("../../config.zig");
 const Config = configpkg.Config;
 const CoreApp = @import("../../App.zig");
 const CoreSurface = @import("../../Surface.zig");
+const global = @import("../../global.zig");
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
 const SplitTree = @import("SplitTree.zig");
@@ -164,7 +165,7 @@ alloc: Allocator,
 running: bool = true,
 
 /// All top-level windows owned by this app.
-windows: std.ArrayListUnmanaged(*Window) = .{},
+windows: std.ArrayListUnmanaged(*Window) = .empty,
 
 /// The window that currently has focus.
 focused_window: ?*Window = null,
@@ -1083,7 +1084,7 @@ pub fn performIpc(
     value: apprt.ipc.Action.Value(action),
 ) !bool {
     var buf: [256]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&buf);
+    var stderr_writer = std.Io.File.stderr().writer(global.io(), &buf);
     const stderr = &stderr_writer.interface;
 
     switch (action) {
@@ -1271,32 +1272,13 @@ fn handleTextInput(surface: *Surface, msg: UINT, wparam: WPARAM) LRESULT {
                 consumed_mods.alt = true;
             }
 
-            // IME/dead-key composed text (CJK, accented letters, ...) is
-            // delivered via WM_CHAR/WM_SYSCHAR while modifier keys may still
-            // be held physically. For example CorvusSKK confirms a conversion
-            // with Ctrl+J, so Ctrl is down at the moment the committed
-            // characters arrive. The core's legacy encoder emits a fixterms
-            // "CSI <codepoint>;<mods>u" sequence for any Ctrl + single
-            // codepoint (see input/key_encode.zig), which turns committed
-            // text like "相" into garbage such as "ESC[30456;5u" in the
-            // shell. Such modifiers were consumed to compose the character,
-            // not to trigger a shortcut. Control characters (< 0x20) are
-            // already filtered above.
-            //
-            // Non-ASCII WM_CHAR output can come from either composition
-            // (Ctrl held for the IME commit, or AltGr = Ctrl+RightAlt) or an
-            // intentional "Alt + <non-ASCII key>" shortcut. Only the former
-            // should have its modifiers dropped. When Alt is held without
-            // Ctrl we keep Alt so the core still encodes the meta/ESC-prefixed
-            // shortcut; every Ctrl-held case (SKK commit, AltGr) clears the
-            // modifiers so the raw UTF-8 text is emitted instead of CSI-u.
-            if (codepoint >= 0x80) {
-                if (mods.alt and !mods.ctrl) {
-                    consumed_mods = .{};
-                } else {
-                    effective_mods = .{};
-                    consumed_mods = .{};
-                }
+            // Some IMEs commit non-ASCII text through WM_CHAR while Ctrl is
+            // still held for the commit key. The legacy encoder treats
+            // Ctrl+single-codepoint text as CSI-u, so clear the live modifiers
+            // for this text path and emit the committed UTF-8 directly.
+            if (codepoint >= 0x80 and mods.ctrl) {
+                effective_mods = .{};
+                consumed_mods = .{};
             }
 
             const event = input.KeyEvent{
@@ -1777,9 +1759,9 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
         },
         0x010D => { // WM_IME_STARTCOMPOSITION
             if (surface.core_surface) |core| {
-                core.renderer_state.mutex.lock();
+                core.renderer_state.mutex.lockUncancelable(global.io());
                 const cursor = core.renderer_state.terminal.screens.active.cursor;
-                core.renderer_state.mutex.unlock();
+                core.renderer_state.mutex.unlock(global.io());
                 const x: i32 = @intCast(cursor.x * core.size.cell.width + core.size.padding.left);
                 const y: i32 = @intCast(cursor.y * core.size.cell.height + core.size.padding.top);
 
