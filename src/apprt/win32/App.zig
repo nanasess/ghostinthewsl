@@ -1331,46 +1331,61 @@ fn handleTextInput(surface: *Surface, msg: UINT, wparam: WPARAM) LRESULT {
     return 0;
 }
 
-/// Upper bound on an IME composition we're willing to carry, in UTF-16
-/// code units. Compositions are a handful of characters in practice, so
-/// anything past this is dropped with a warning rather than truncated in
-/// the middle of a codepoint.
-const ime_utf16_max = 256;
-
-/// Worst case UTF-8 expansion of `ime_utf16_max` code units.
-const ime_utf8_max = ime_utf16_max * 4;
+/// Sanity bound on a composition string, in bytes as reported by IMM32.
+/// Committed text can legitimately be long — speech and handwriting input
+/// hand over whole sentences at once — so this is only here to keep a
+/// broken IME from asking us for an absurd allocation.
+const ime_string_byte_max = 1024 * 1024;
 
 /// Read one of the IMM composition strings (GCS_COMPSTR / GCS_RESULTSTR)
-/// and convert it to UTF-8 in `buf`. Returns null when the string is empty
-/// or doesn't fit.
+/// and convert it to UTF-8. The caller owns the returned memory. Returns
+/// null when the string is empty or can't be read.
 ///
 /// Note the W variants report a length in *bytes*, not UTF-16 code units,
 /// and the string they write back is not NUL terminated.
-fn readCompositionString(himc: ?*anyopaque, index: DWORD, buf: []u8) ?[]const u8 {
+fn readCompositionString(alloc: Allocator, himc: ?*anyopaque, index: DWORD) ?[]u8 {
     const byte_len = ImmGetCompositionStringW(himc, index, null, 0);
     if (byte_len <= 0) return null;
 
-    var utf16_buf: [ime_utf16_max]u16 = undefined;
-    if (@as(usize, @intCast(byte_len)) > utf16_buf.len * 2) {
-        log.warn("ime composition string too long, dropping bytes={d}", .{byte_len});
+    const bytes: usize = @intCast(byte_len);
+    if (bytes > ime_string_byte_max) {
+        log.warn("ime composition string too long, dropping bytes={d}", .{bytes});
         return null;
     }
+
+    // Round up: IMM32 reports whole UTF-16 units in practice, but an odd
+    // byte count would otherwise leave the last byte outside the buffer.
+    const utf16 = alloc.alloc(u16, (bytes + 1) / 2) catch {
+        log.warn("out of memory reading ime composition string", .{});
+        return null;
+    };
+    defer alloc.free(utf16);
 
     const written = ImmGetCompositionStringW(
         himc,
         index,
-        @ptrCast(&utf16_buf),
-        @intCast(byte_len),
+        @ptrCast(utf16.ptr),
+        @intCast(bytes),
     );
     if (written <= 0) return null;
 
-    const utf16 = utf16_buf[0 .. @as(usize, @intCast(written)) / 2];
-    const len = std.unicode.utf16LeToUtf8(buf, utf16) catch |err| {
-        log.warn("ime composition string is not valid UTF-16: {}", .{err});
+    // Clamp to what we actually allocated; a second call can in principle
+    // report more than the first one did.
+    const written_units = @min(@as(usize, @intCast(written)) / 2, utf16.len);
+
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(
+        alloc,
+        utf16[0..written_units],
+    ) catch |err| {
+        log.warn("failed to decode ime composition string: {}", .{err});
         return null;
     };
-    if (len == 0) return null;
-    return buf[0..len];
+
+    if (utf8.len == 0) {
+        alloc.free(utf8);
+        return null;
+    }
+    return utf8;
 }
 
 /// Send text the IME committed to the core surface.
@@ -1838,6 +1853,14 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
             return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         0x0101, 0x0105 => {
+            // WM_KEYUP / WM_SYSKEYUP. The press half is suppressed while
+            // composing (see WM_KEYDOWN), so the release has to go too:
+            // with the Kitty keyboard protocol's report_events flag a lone
+            // release is encoded to the pty (input/key_encode.zig), which
+            // would leak orphan release sequences for every key used to
+            // build the preedit.
+            if (surface.im_composing) return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+
             if (surface.core_surface) |core| {
                 const mods = getModifiers();
                 const key = mapVirtualKey(wparam);
@@ -1960,6 +1983,8 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
             return 0;
         },
         WM_IME_COMPOSITION => {
+            const core = surface.core_surface orelse
+                return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
             const himc = ImmGetContext(hwnd) orelse
                 return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
             defer _ = ImmReleaseContext(hwnd, himc);
@@ -1967,8 +1992,8 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
             // Committed text first: a single message can carry a result
             // string and the start of the next composition.
             if (lparam & GCS_RESULTSTR != 0) {
-                var buf: [ime_utf8_max]u8 = undefined;
-                if (readCompositionString(himc, GCS_RESULTSTR, &buf)) |text| {
+                if (readCompositionString(core.alloc, himc, GCS_RESULTSTR)) |text| {
+                    defer core.alloc.free(text);
                     commitImeText(surface, text);
                 }
             }
@@ -1976,13 +2001,12 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
             // Preedit. An empty GCS_COMPSTR — or a bare notification with
             // no flags at all — means the composition was cleared.
             if (lparam & GCS_COMPSTR != 0 or lparam == 0) {
-                var buf: [ime_utf8_max]u8 = undefined;
-                const text = readCompositionString(himc, GCS_COMPSTR, &buf);
-                if (surface.core_surface) |core| {
-                    core.preeditCallback(text) catch |err| {
-                        log.warn("preedit callback error: {}", .{err});
-                    };
-                }
+                const text = readCompositionString(core.alloc, himc, GCS_COMPSTR);
+                defer if (text) |t| core.alloc.free(t);
+
+                core.preeditCallback(text) catch |err| {
+                    log.warn("preedit callback error: {}", .{err});
+                };
                 updateImeWindows(app, surface, hwnd, himc);
             }
 
