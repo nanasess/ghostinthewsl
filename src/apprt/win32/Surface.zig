@@ -132,6 +132,10 @@ height: u32 = 600,
 /// Last known cursor position in client pixels.
 cursor_pos: apprt.CursorPos = .{ .x = 0, .y = 0 },
 
+/// True while an IME composition is in flight on this surface. Key presses
+/// are left to the IME while this is set (see App.surfaceDispatch).
+im_composing: bool = false,
+
 /// UTF-8 window title cache for title reporting.
 title_buf: [1024:0]u8 = [_:0]u8{0} ** 1024,
 progress_hwnd: ?HWND = null,

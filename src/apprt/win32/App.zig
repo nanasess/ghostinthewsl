@@ -93,6 +93,9 @@ extern "imm32" fn ImmGetContext(hWnd: HWND) callconv(.winapi) ?*anyopaque;
 extern "imm32" fn ImmReleaseContext(hWnd: HWND, hIMC: ?*anyopaque) callconv(.winapi) BOOL;
 extern "imm32" fn ImmSetCompositionWindow(hIMC: ?*anyopaque, lpCompForm: *COMPOSITIONFORM) callconv(.winapi) BOOL;
 extern "imm32" fn ImmSetCompositionFontW(hIMC: ?*anyopaque, lplf: *LOGFONTW) callconv(.winapi) BOOL;
+extern "imm32" fn ImmGetCompositionStringW(hIMC: ?*anyopaque, dwIndex: DWORD, lpBuf: ?*anyopaque, dwBufLen: DWORD) callconv(.winapi) i32;
+extern "imm32" fn ImmSetCandidateWindow(hIMC: ?*anyopaque, lpCandidate: *CANDIDATEFORM) callconv(.winapi) BOOL;
+extern "imm32" fn ImmNotifyIME(hIMC: ?*anyopaque, dwAction: DWORD, dwIndex: DWORD, dwValue: DWORD) callconv(.winapi) BOOL;
 extern "shell32" fn Shell_NotifyIconW(dwMessage: DWORD, lpData: *NOTIFYICONDATAW) callconv(.winapi) BOOL;
 
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
@@ -104,6 +107,35 @@ const COMPOSITIONFORM = extern struct {
     ptCurrentPos: sys.POINT,
     rcArea: RECT,
 };
+
+const CANDIDATEFORM = extern struct {
+    dwIndex: DWORD,
+    dwStyle: DWORD,
+    ptCurrentPos: sys.POINT,
+    rcArea: RECT,
+};
+
+// IME messages. We handle composition ourselves so the preedit renders in
+// the terminal grid instead of in the IME's own composition window.
+const WM_IME_STARTCOMPOSITION: UINT = 0x010D;
+const WM_IME_ENDCOMPOSITION: UINT = 0x010E;
+const WM_IME_COMPOSITION: UINT = 0x010F;
+const WM_IME_SETCONTEXT: UINT = 0x0281;
+
+// ImmGetCompositionStringW indices.
+const GCS_COMPSTR = 0x0008;
+const GCS_RESULTSTR = 0x0800;
+
+// COMPOSITIONFORM / CANDIDATEFORM styles.
+const CFS_POINT = 0x0002;
+const CFS_CANDIDATEPOS = 0x0040;
+
+// WM_IME_SETCONTEXT lparam flag for the IME-drawn composition window.
+const ISC_SHOWUICOMPOSITIONWINDOW: LPARAM = 0x8000_0000;
+
+// ImmNotifyIME actions.
+const NI_COMPOSITIONSTR = 0x0015;
+const CPS_CANCEL = 0x0004;
 
 const LOGFONTW = extern struct {
     lfHeight: i32,
@@ -1299,6 +1331,142 @@ fn handleTextInput(surface: *Surface, msg: UINT, wparam: WPARAM) LRESULT {
     return 0;
 }
 
+/// Upper bound on an IME composition we're willing to carry, in UTF-16
+/// code units. Compositions are a handful of characters in practice, so
+/// anything past this is dropped with a warning rather than truncated in
+/// the middle of a codepoint.
+const ime_utf16_max = 256;
+
+/// Worst case UTF-8 expansion of `ime_utf16_max` code units.
+const ime_utf8_max = ime_utf16_max * 4;
+
+/// Read one of the IMM composition strings (GCS_COMPSTR / GCS_RESULTSTR)
+/// and convert it to UTF-8 in `buf`. Returns null when the string is empty
+/// or doesn't fit.
+///
+/// Note the W variants report a length in *bytes*, not UTF-16 code units,
+/// and the string they write back is not NUL terminated.
+fn readCompositionString(himc: ?*anyopaque, index: DWORD, buf: []u8) ?[]const u8 {
+    const byte_len = ImmGetCompositionStringW(himc, index, null, 0);
+    if (byte_len <= 0) return null;
+
+    var utf16_buf: [ime_utf16_max]u16 = undefined;
+    if (@as(usize, @intCast(byte_len)) > utf16_buf.len * 2) {
+        log.warn("ime composition string too long, dropping bytes={d}", .{byte_len});
+        return null;
+    }
+
+    const written = ImmGetCompositionStringW(
+        himc,
+        index,
+        @ptrCast(&utf16_buf),
+        @intCast(byte_len),
+    );
+    if (written <= 0) return null;
+
+    const utf16 = utf16_buf[0 .. @as(usize, @intCast(written)) / 2];
+    const len = std.unicode.utf16LeToUtf8(buf, utf16) catch |err| {
+        log.warn("ime composition string is not valid UTF-16: {}", .{err});
+        return null;
+    };
+    if (len == 0) return null;
+    return buf[0..len];
+}
+
+/// Send text the IME committed to the core surface.
+///
+/// This goes through keyCallback rather than textCallback on purpose:
+/// textCallback is the paste path (completeClipboardPaste), so committed
+/// text would arrive wrapped in bracketed paste markers. The event shape
+/// mirrors the GTK apprt's commit handler — an unidentified key with no
+/// modifiers, so nothing re-encodes the text as a control sequence.
+fn commitImeText(surface: *Surface, text: []const u8) void {
+    const core = surface.core_surface orelse return;
+
+    core.preeditCallback(null) catch |err| {
+        log.warn("preedit callback error: {}", .{err});
+    };
+
+    _ = core.keyCallback(.{
+        .action = .press,
+        .key = .unidentified,
+        .mods = .{},
+        .consumed_mods = .{},
+        .composing = false,
+        .utf8 = text,
+    }) catch |err| {
+        log.err("ime commit key callback error: {}", .{err});
+        return;
+    };
+}
+
+/// Point the IME's composition and candidate windows at the terminal
+/// cursor. Called when composition starts and on every preedit change so
+/// the candidate list follows the caret instead of freezing where the
+/// composition began.
+///
+/// The coordinates are client-area pixels. Surface.imePoint() is
+/// deliberately not used: it divides by the content scale to produce the
+/// logical coordinates macOS and GTK want, while IMM32 wants raw client
+/// pixels.
+fn updateImeWindows(app: *App, surface: *Surface, hwnd: HWND, himc: ?*anyopaque) void {
+    const core = surface.core_surface orelse return;
+
+    core.renderer_state.mutex.lockUncancelable(global.io());
+    const cursor = core.renderer_state.terminal.screens.active.cursor;
+    core.renderer_state.mutex.unlock(global.io());
+
+    const x: i32 = @intCast(cursor.x * core.size.cell.width + core.size.padding.left);
+    const y: i32 = @intCast(cursor.y * core.size.cell.height + core.size.padding.top);
+    const below: i32 = y + @as(i32, @intCast(core.size.cell.height));
+
+    var cf = COMPOSITIONFORM{
+        .dwStyle = CFS_POINT,
+        .ptCurrentPos = .{ .x = x, .y = y },
+        .rcArea = std.mem.zeroes(RECT),
+    };
+    _ = ImmSetCompositionWindow(himc, &cf);
+
+    // Candidates go on the line below so the list doesn't cover the text
+    // being composed.
+    var candidate = CANDIDATEFORM{
+        .dwIndex = 0,
+        .dwStyle = CFS_CANDIDATEPOS,
+        .ptCurrentPos = .{ .x = x, .y = below },
+        .rcArea = std.mem.zeroes(RECT),
+    };
+    _ = ImmSetCandidateWindow(himc, &candidate);
+
+    // Font hint so the IME sizes its own UI to match the terminal text.
+    const dpi = sys.GetDpiForWindow(hwnd);
+    const dpi_f: f32 = if (dpi > 0) @floatFromInt(dpi) else 96.0;
+    const font_px: i32 = @intFromFloat(app.config.@"font-size" * dpi_f / 72.0);
+    var lf: LOGFONTW = std.mem.zeroes(LOGFONTW);
+    lf.lfHeight = -font_px;
+    lf.lfWidth = 0;
+    lf.lfCharSet = 1;
+    _ = ImmSetCompositionFontW(himc, &lf);
+}
+
+/// Drop any in-flight composition. Focus loss can otherwise strand the
+/// preedit on screen and leave `im_composing` set, which would suppress
+/// every key press once the surface is focused again.
+fn cancelComposition(surface: *Surface, hwnd: HWND) void {
+    if (!surface.im_composing) return;
+    surface.im_composing = false;
+
+    if (ImmGetContext(hwnd)) |himc| {
+        defer _ = ImmReleaseContext(hwnd, himc);
+        _ = ImmNotifyIME(himc, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+    }
+
+    if (surface.core_surface) |core| {
+        core.preeditCallback(null) catch |err| {
+            log.warn("preedit callback error: {}", .{err});
+        };
+    }
+}
+
 fn isTextVirtualKey(vk: WPARAM) bool {
     return switch (vk) {
         0x41...0x5A,
@@ -1625,6 +1793,12 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
         },
         WM_CHAR, 0x0106 => return handleTextInput(surface, msg, wparam),
         WM_KEYDOWN, 0x0104 => {
+            // While a composition is in flight the keystrokes belong to the
+            // IME. Encoding them here would leak the keys the IME chose not
+            // to consume into the pty mid-composition. The GTK apprt guards
+            // the same way with its im_composing flag.
+            if (surface.im_composing) return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+
             if (surface.core_surface) |core| {
                 const mods = getModifiers();
                 if (!shouldDispatchKeyPress(wparam, mods)) return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -1773,37 +1947,75 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
             }
             return 0;
         },
-        0x010D => { // WM_IME_STARTCOMPOSITION
-            if (surface.core_surface) |core| {
-                core.renderer_state.mutex.lockUncancelable(global.io());
-                const cursor = core.renderer_state.terminal.screens.active.cursor;
-                core.renderer_state.mutex.unlock(global.io());
-                const x: i32 = @intCast(cursor.x * core.size.cell.width + core.size.padding.left);
-                const y: i32 = @intCast(cursor.y * core.size.cell.height + core.size.padding.top);
+        WM_IME_STARTCOMPOSITION => {
+            // We render the preedit inside the terminal grid (see
+            // WM_IME_COMPOSITION below), so DefWindowProcW must not run:
+            // it would show the IME's own composition window on top of the
+            // terminal and the text would appear twice.
+            surface.im_composing = true;
+            if (ImmGetContext(hwnd)) |himc| {
+                defer _ = ImmReleaseContext(hwnd, himc);
+                updateImeWindows(app, surface, hwnd, himc);
+            }
+            return 0;
+        },
+        WM_IME_COMPOSITION => {
+            const himc = ImmGetContext(hwnd) orelse
+                return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+            defer _ = ImmReleaseContext(hwnd, himc);
 
-                const himc = ImmGetContext(hwnd);
-                if (himc) |ctx| {
-                    defer _ = ImmReleaseContext(hwnd, ctx);
-                    var cf = COMPOSITIONFORM{
-                        .dwStyle = 0x0002,
-                        .ptCurrentPos = .{ .x = x, .y = y },
-                        .rcArea = std.mem.zeroes(RECT),
-                    };
-                    _ = ImmSetCompositionWindow(ctx, &cf);
-
-                    const dpi = sys.GetDpiForWindow(hwnd);
-                    const dpi_f: f32 = if (dpi > 0) @floatFromInt(dpi) else 96.0;
-                    const font_px: i32 = @intFromFloat(app.config.@"font-size" * dpi_f / 72.0);
-                    var lf: LOGFONTW = std.mem.zeroes(LOGFONTW);
-                    lf.lfHeight = -font_px;
-                    lf.lfWidth = 0;
-                    lf.lfCharSet = 1;
-                    _ = ImmSetCompositionFontW(ctx, &lf);
+            // Committed text first: a single message can carry a result
+            // string and the start of the next composition.
+            if (lparam & GCS_RESULTSTR != 0) {
+                var buf: [ime_utf8_max]u8 = undefined;
+                if (readCompositionString(himc, GCS_RESULTSTR, &buf)) |text| {
+                    commitImeText(surface, text);
                 }
             }
-            return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+
+            // Preedit. An empty GCS_COMPSTR — or a bare notification with
+            // no flags at all — means the composition was cleared.
+            if (lparam & GCS_COMPSTR != 0 or lparam == 0) {
+                var buf: [ime_utf8_max]u8 = undefined;
+                const text = readCompositionString(himc, GCS_COMPSTR, &buf);
+                if (surface.core_surface) |core| {
+                    core.preeditCallback(text) catch |err| {
+                        log.warn("preedit callback error: {}", .{err});
+                    };
+                }
+                updateImeWindows(app, surface, hwnd, himc);
+            }
+
+            // Returning 0 keeps DefWindowProcW from synthesizing
+            // WM_IME_CHAR / WM_CHAR for the text committed above.
+            return 0;
+        },
+        WM_IME_ENDCOMPOSITION => {
+            surface.im_composing = false;
+            if (surface.core_surface) |core| {
+                core.preeditCallback(null) catch |err| {
+                    log.warn("preedit callback error: {}", .{err});
+                };
+            }
+            return 0;
+        },
+        WM_IME_SETCONTEXT => {
+            // Same reason as WM_IME_STARTCOMPOSITION: keep the IME from
+            // drawing its own composition window. The candidate window is
+            // left alone — that one we want.
+            return sys.DefWindowProcW(
+                hwnd,
+                msg,
+                wparam,
+                lparam & ~ISC_SHOWUICOMPOSITIONWINDOW,
+            );
         },
         0x0007, 0x0008 => {
+            // WM_KILLFOCUS. Losing focus mid-composition would strand the
+            // preedit on screen with im_composing still set, which
+            // suppresses every later key press.
+            if (msg == 0x0008) cancelComposition(surface, hwnd);
+
             if (surface.core_surface) |core| {
                 const focused = msg == 0x0007;
                 core.focusCallback(focused) catch {};
