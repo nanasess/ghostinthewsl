@@ -136,6 +136,11 @@ cursor_pos: apprt.CursorPos = .{ .x = 0, .y = 0 },
 /// are left to the IME while this is set (see App.surfaceDispatch).
 im_composing: bool = false,
 
+/// True when a WM_IME_CHAR is on its way to becoming a WM_CHAR. It marks
+/// that character as IME-committed text so the composition guard on
+/// WM_CHAR lets it through.
+ime_char_pending: bool = false,
+
 /// UTF-8 window title cache for title reporting.
 title_buf: [1024:0]u8 = [_:0]u8{0} ** 1024,
 progress_hwnd: ?HWND = null,

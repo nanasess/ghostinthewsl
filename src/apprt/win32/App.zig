@@ -121,6 +121,7 @@ const WM_IME_STARTCOMPOSITION: UINT = 0x010D;
 const WM_IME_ENDCOMPOSITION: UINT = 0x010E;
 const WM_IME_COMPOSITION: UINT = 0x010F;
 const WM_IME_SETCONTEXT: UINT = 0x0281;
+const WM_IME_CHAR: UINT = 0x0286;
 
 // ImmGetCompositionStringW indices.
 const GCS_COMPSTR = 0x0008;
@@ -1469,6 +1470,7 @@ fn updateImeWindows(app: *App, surface: *Surface, hwnd: HWND, himc: ?*anyopaque)
 fn cancelComposition(surface: *Surface, hwnd: HWND) void {
     if (!surface.im_composing) return;
     surface.im_composing = false;
+    surface.ime_char_pending = false;
 
     if (ImmGetContext(hwnd)) |himc| {
         defer _ = ImmReleaseContext(hwnd, himc);
@@ -1806,7 +1808,38 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
             }
             return 0;
         },
-        WM_CHAR, 0x0106 => return handleTextInput(surface, msg, wparam),
+        WM_CHAR, 0x0106 => {
+            // WM_SYSCHAR shares this arm.
+            //
+            // TranslateMessage synthesizes the character message from
+            // WM_KEYDOWN before the message is dispatched, so the
+            // im_composing guard on WM_KEYDOWN can't stop it: a key the IME
+            // declined to consume mid-composition would still reach the pty
+            // as text. Drop those.
+            //
+            // The exception is text the IME itself handed us through
+            // WM_IME_CHAR, which DefWindowProcW turns into WM_CHAR. That's the
+            // commit path for IMEs that don't deliver GCS_RESULTSTR and it has
+            // to survive, so it's flagged as it passes through (see below).
+            if (surface.im_composing and !surface.ime_char_pending) return 0;
+            surface.ime_char_pending = false;
+            return handleTextInput(surface, msg, wparam);
+        },
+        WM_IME_CHAR => {
+            // Committed text from an IME that doesn't use GCS_RESULTSTR. Hand
+            // it to DefWindowProcW so the codepoint decoding and the ctrl-mods
+            // guard stay in handleTextInput alone, and flag it so the guard
+            // above lets the resulting WM_CHAR through.
+            //
+            // The flag is deliberately cleared by whoever consumes it rather
+            // than on the way out of this arm: DefWindowProcW is free to post
+            // the WM_CHAR instead of sending it, and clearing eagerly would
+            // then swallow the commit. A flag that is never consumed is
+            // harmless — it only lets a single character through during a
+            // composition, which is what happened before this guard existed.
+            surface.ime_char_pending = true;
+            return sys.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         WM_KEYDOWN, 0x0104 => {
             // While a composition is in flight the keystrokes belong to the
             // IME. Encoding them here would leak the keys the IME chose not
@@ -2016,6 +2049,7 @@ pub fn surfaceDispatch(app: *App, surface: *Surface, hwnd: HWND, msg: UINT, wpar
         },
         WM_IME_ENDCOMPOSITION => {
             surface.im_composing = false;
+            surface.ime_char_pending = false;
             if (surface.core_surface) |core| {
                 core.preeditCallback(null) catch |err| {
                     log.warn("preedit callback error: {}", .{err});
