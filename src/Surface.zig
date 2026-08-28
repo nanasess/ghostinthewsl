@@ -2277,11 +2277,28 @@ fn resolvePathForOpening(
     path: []const u8,
 ) Allocator.Error!?[]const u8 {
     if (!std.fs.path.isAbsolute(path)) {
+        // On Windows the terminal pwd is a POSIX path when the session runs
+        // inside WSL, while `std.fs.path` applies Windows semantics. Feeding
+        // a URL-like string into resolution can reach `accessAbsolute` with a
+        // non-absolute result, which trips a safety panic that `catch` cannot
+        // recover from. Leave anything with a `:` to the URL opener.
+        // Ported from GhostInTheWSL (nanasess/ghostinthewsl#1).
+        if (builtin.os.tag == .windows and
+            std.mem.indexOfScalar(u8, path, ':') != null) return null;
+
         const terminal_pwd = self.io.terminal.getPwd() orelse {
             return null;
         };
 
         const resolved = try std.fs.path.resolve(self.alloc, &.{ terminal_pwd, path });
+
+        // `accessAbsolute` asserts its argument is absolute. Resolution can
+        // still yield a relative path (e.g. a POSIX pwd under Windows
+        // semantics), so re-check rather than letting the assert fire.
+        if (!std.fs.path.isAbsolute(resolved)) {
+            self.alloc.free(resolved);
+            return null;
+        }
 
         std.fs.accessAbsolute(resolved, .{}) catch {
             self.alloc.free(resolved);
