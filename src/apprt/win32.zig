@@ -7054,12 +7054,47 @@ pub const App = struct {
         return .{ .hdc = hdc, .hglrc = hglrc };
     }
 
+    /// Open a URL (or a local path) with the shell's default handler.
+    ///
+    /// `ShellExecuteW` is not a quick call: it can start a COM server and
+    /// some handlers put up UI of their own, so invoking it synchronously
+    /// from the UI thread wedges the whole app until the handler returns.
+    /// Hand it to a detached thread with its own STA apartment instead.
+    /// Ported from GhostInTheWSL (nanasess/ghostinthewsl#1).
     fn openUrl(self: *App, url: []const u8) !void {
-        const url_w = try std.unicode.utf8ToUtf16LeAllocZ(self.core_app.alloc, url);
-        defer self.core_app.alloc.free(url_w);
+        _ = self;
+
+        // Allocate from the page allocator so the detached thread can free
+        // the buffer without depending on the app allocator's lifetime.
+        const url_w = try std.unicode.utf8ToUtf16LeAllocZ(std.heap.page_allocator, url);
+
+        const thread = std.Thread.spawn(.{}, openUrlThread, .{url_w}) catch |err| {
+            // Never let the action become a no-op just because we could not
+            // spawn; fall back to the old synchronous path.
+            defer std.heap.page_allocator.free(url_w);
+            log.warn("open_url: thread spawn failed, opening synchronously err={}", .{err});
+            const result = ShellExecuteW(null, shell_open, url_w.ptr, null, null, SW_SHOW);
+            if (@intFromPtr(result) <= 32) return error.OpenUrlFailed;
+            return;
+        };
+        thread.detach();
+    }
+
+    /// Runs `ShellExecuteW` off the UI thread in its own STA apartment.
+    /// Errors are only logged: the caller has already returned by now.
+    fn openUrlThread(url_w: [:0]u16) void {
+        defer std.heap.page_allocator.free(url_w);
+
+        // 0 = S_OK, 1 = S_FALSE ("already initialised in this mode"). Only
+        // those two take responsibility for the apartment, so only those two
+        // pair with CoUninitialize.
+        const hr = CoInitializeEx(null, COINIT_APARTMENTTHREADED);
+        defer if (hr == 0 or hr == 1) CoUninitialize();
 
         const result = ShellExecuteW(null, shell_open, url_w.ptr, null, null, SW_SHOW);
-        if (@intFromPtr(result) <= 32) return error.OpenUrlFailed;
+        if (@intFromPtr(result) <= 32) {
+            log.warn("open_url: ShellExecuteW failed result={d}", .{@intFromPtr(result)});
+        }
     }
 
     fn openConfig(self: *App) !void {
