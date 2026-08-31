@@ -11,15 +11,9 @@
         // Zig libs
 
         .libxev = .{
-            // nanasess/libxev, forked from the pinned mitchellh/libxev
-            // 34fa50878 with a single commit (de97685) that skips stale
-            // completion-queue entries whose result is null. Guards a
-            // completion-reuse race in the IOCP backend hit by the renderer's
-            // cursor blink timer (`loop.timer` re-inits a completion that is
-            // still linked in the queue, clearing `result`, and the queue
-            // drain then unwraps it). See nanasess/ghostinthewsl#4 / #5.
-            .url = "https://github.com/nanasess/libxev/archive/de97685122ca5c31039cda87d321936b743105f0.tar.gz",
-            .hash = "libxev-0.0.0-86vtc4YiEwCgHkvAjMYUFTgZEL1R_o-CnpWCNb40n1r4",
+            // mitchellh/libxev
+            .url = "https://deps.files.ghostty.org/libxev-34fa50878aec6e5fa8f532867001ab3c36fae23e.tar.gz",
+            .hash = "libxev-0.0.0-86vtc4IcEwCqEYxEYoN_3KXmc6A9VLcm22aVImfvecYs",
             .lazy = true,
         },
         .vaxis = .{
